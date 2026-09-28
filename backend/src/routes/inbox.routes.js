@@ -57,14 +57,83 @@ router.get('/threads', async (req, res) => {
 router.get('/threads/:threadId/messages', async (req, res) => {
   try {
     const { threadId } = req.params;
-    const messages = await Message.find({ threadId }).sort({ timestamp: 1 });
+    const [messagesDocs, thread] = await Promise.all([
+      Message.find({ threadId }).sort({ timestamp: 1 }).lean(),
+      ChatThread.findById(threadId).populate('leadId').lean(),
+    ]);
 
     // Mark thread read
     await ChatThread.findByIdAndUpdate(threadId, { unreadCount: 0 });
 
+    // Identify the initial cold outreach message
+    let initialOutreachMsg = messagesDocs.find(
+      (m) => m.isOutreach === true || m.metadata?.isOutreach === true
+    );
+
+    // Fallback detection for existing or legacy messages
+    if (!initialOutreachMsg) {
+      if (thread?.initialOutreachMessage?.text) {
+        initialOutreachMsg = messagesDocs.find(
+          (m) => m.direction === 'outbound' && m.text === thread.initialOutreachMessage.text
+        );
+      }
+      if (!initialOutreachMsg && thread?.leadId?.sentContent) {
+        initialOutreachMsg = messagesDocs.find(
+          (m) => m.direction === 'outbound' && m.text === thread.leadId.sentContent
+        );
+      }
+      if (!initialOutreachMsg) {
+        initialOutreachMsg = messagesDocs.find((m) => m.direction === 'outbound');
+      }
+    }
+
+    const outreachIdStr = initialOutreachMsg ? String(initialOutreachMsg._id) : null;
+
+    // Enriched messages with explicit boolean isOutreach
+    const enrichedMessages = messagesDocs.map((m) => ({
+      ...m,
+      isOutreach: Boolean(
+        m.isOutreach ||
+        m.metadata?.isOutreach ||
+        (outreachIdStr && String(m._id) === outreachIdStr)
+      ),
+    }));
+
+    // Build structured outreachMessage object
+    const outreachMessage = initialOutreachMsg
+      ? {
+          _id: initialOutreachMsg._id,
+          text: initialOutreachMsg.text,
+          timestamp: initialOutreachMsg.timestamp,
+          sessionId: initialOutreachMsg.sessionId,
+          accountLabel: thread?.accountLabel || initialOutreachMsg.sessionId,
+          status: initialOutreachMsg.status,
+          isOutreach: true,
+        }
+      : thread?.initialOutreachMessage?.text
+      ? {
+          text: thread.initialOutreachMessage.text,
+          timestamp: thread.initialOutreachMessage.sentAt || thread.createdAt,
+          sessionId: thread.initialOutreachMessage.sessionId || thread.assignedSessionId,
+          accountLabel: thread.initialOutreachMessage.accountLabel || thread.accountLabel,
+          status: 'sent',
+          isOutreach: true,
+        }
+      : thread?.leadId?.sentContent
+      ? {
+          text: thread.leadId.sentContent,
+          timestamp: thread.leadId.lastMessageSentAt || thread.createdAt,
+          sessionId: thread.assignedSessionId,
+          accountLabel: thread.accountLabel || thread.assignedSessionId,
+          status: 'sent',
+          isOutreach: true,
+        }
+      : null;
+
     res.json({
       success: true,
-      data: messages,
+      data: enrichedMessages,
+      outreachMessage,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -172,7 +241,11 @@ router.post('/simulate', async (req, res) => {
     }
 
     const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-    const activeSessionId = sessionId || 'session_1';
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      const firstAcc = await Account.findOne();
+      activeSessionId = firstAcc?.sessionId || 'default';
+    }
 
     // Ensure lead exists
     let lead = await Lead.findOne({ phone: new RegExp(cleanPhone.slice(-10) + '$') });

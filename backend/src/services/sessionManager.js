@@ -29,49 +29,105 @@ class SessionManager {
   }
 
   /**
+   * Helper to resolve the isolated auth directory for a session
+   */
+  getSessionDir(sessionId) {
+    return path.join(SESSIONS_BASE_DIR, sessionId);
+  }
+
+  /**
+   * Normalizes any duplicate prefix directories (e.g. session_session_xxx -> session_xxx)
+   */
+  normalizeSessionDirs() {
+    if (!fs.existsSync(SESSIONS_BASE_DIR)) return;
+    try {
+      const entries = fs.readdirSync(SESSIONS_BASE_DIR, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith('session_session_')) {
+          const normalizedName = entry.name.replace(/^session_session_/, 'session_');
+          const oldPath = path.join(SESSIONS_BASE_DIR, entry.name);
+          const newPath = path.join(SESSIONS_BASE_DIR, normalizedName);
+          if (!fs.existsSync(newPath)) {
+            fs.renameSync(oldPath, newPath);
+            console.log(`[SessionManager] Normalized directory: ${entry.name} -> ${normalizedName}`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[SessionManager] Directory normalization notice:', err.message);
+    }
+  }
+
+  /**
    * Initializes all accounts on engine startup.
-   * Migrates legacy single-session credentials if present.
+   * Dynamically loads all accounts from MongoDB and restores existing disk auth sessions.
    */
   async initAllSessions() {
     if (!fs.existsSync(SESSIONS_BASE_DIR)) {
       fs.mkdirSync(SESSIONS_BASE_DIR, { recursive: true });
     }
 
-    let accounts = await Account.find();
+    // Step A: Normalize directory structure
+    this.normalizeSessionDirs();
 
-    // Check for backwards compatibility / legacy single-session migration
-    if (accounts.length === 0) {
-      const primarySessionId = 'session_1';
-      const targetDir = path.join(SESSIONS_BASE_DIR, `session_${primarySessionId}`);
+    // Step B: Auto-discover and register any existing session auth folders on disk if DB was fresh
+    try {
+      const diskEntries = fs.readdirSync(SESSIONS_BASE_DIR, { withFileTypes: true });
+      for (const entry of diskEntries) {
+        if (!entry.isDirectory()) continue;
+        const sessionId = entry.name;
+        const credsPath = path.join(SESSIONS_BASE_DIR, sessionId, 'creds.json');
 
-      // If legacy auth folder exists, migrate it
-      if (fs.existsSync(LEGACY_AUTH_DIR) && fs.existsSync(path.join(LEGACY_AUTH_DIR, 'creds.json'))) {
-        try {
-          if (!fs.existsSync(targetDir)) {
-            fs.mkdirSync(targetDir, { recursive: true });
-            fs.cpSync(LEGACY_AUTH_DIR, targetDir, { recursive: true });
-            console.log(`[SessionManager] Migrated legacy auth session to ${targetDir}`);
+        const existing = await Account.findOne({ sessionId });
+        if (!existing) {
+          let phone = '';
+          let userName = '';
+          if (fs.existsSync(credsPath)) {
+            try {
+              const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+              if (credsData.me?.id) {
+                phone = credsData.me.id.split(':')[0]?.replace(/[^0-9]/g, '') || '';
+              }
+              userName = credsData.me?.name || '';
+            } catch (err) {
+              console.warn(`[SessionManager] Could not parse creds for ${sessionId}:`, err.message);
+            }
           }
-        } catch (copyErr) {
-          console.error('[SessionManager] Error copying legacy auth:', copyErr);
+
+          console.log(`[SessionManager] Auto-registering disk session into database: ${sessionId}`);
+          await Account.create({
+            sessionId,
+            label: userName || `WhatsApp Account (${sessionId})`,
+            phone,
+            userName,
+            status: 'DISCONNECTED',
+            dailyLimit: 20,
+            sentToday: 0,
+            warmupActive: true,
+            healthScore: 65,
+          });
         }
       }
-
-      const initialAccount = await Account.create({
-        sessionId: primarySessionId,
-        label: 'Primary Outreach Account',
-        dailyLimit: 20,
-        status: 'CONNECTING',
-      });
-      accounts = [initialAccount];
+    } catch (scanErr) {
+      console.error('[SessionManager] Error scanning auth_sessions directory:', scanErr.message);
     }
 
-    console.log(`[SessionManager] Spawning ${accounts.length} WhatsApp session(s)...`);
+    // Step C: Query all registered accounts directly from MongoDB
+    const accounts = await Account.find({});
+    console.log(`[SessionManager] Spawning ${accounts.length} registered WhatsApp session(s)...`);
 
+    // Broadcast initial state
+    await this.broadcastAccounts();
+
+    // Step D: Spawn each account session asynchronously
     for (const acc of accounts) {
       acc.checkAndResetDailyQuota();
       await acc.save();
-      this.spawnSession(acc.sessionId).catch((err) => {
+
+      const sessionDir = this.getSessionDir(acc.sessionId);
+      const hasCreds = fs.existsSync(path.join(sessionDir, 'creds.json'));
+
+      this.spawnSession(acc.sessionId, { silent: hasCreds }).catch((err) => {
         console.error(`[SessionManager] Failed to spawn session ${acc.sessionId}:`, err.message);
       });
     }
@@ -80,13 +136,13 @@ class SessionManager {
   /**
    * Spawns an isolated Baileys socket for a specific sessionId
    */
-  async spawnSession(sessionId) {
+  async spawnSession(sessionId, options = {}) {
     if (this.sessions.has(sessionId)) {
       console.log(`[SessionManager] Session ${sessionId} already active.`);
       return this.sessions.get(sessionId);
     }
 
-    const sessionDir = path.join(SESSIONS_BASE_DIR, `session_${sessionId}`);
+    const sessionDir = this.getSessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) {
       fs.mkdirSync(sessionDir, { recursive: true });
     }
@@ -153,6 +209,8 @@ class SessionManager {
               qrDataUrl,
               message: `Scan QR for session ${sessionId}`,
             });
+
+            await this.broadcastAccounts();
           } catch (qrErr) {
             console.error(`[SessionManager] QR error for ${sessionId}:`, qrErr);
           }
@@ -165,21 +223,23 @@ class SessionManager {
           this.sessions.delete(sessionId);
           this.qrCodes.delete(sessionId);
 
-          const finalStatus = shouldReconnect ? 'DISCONNECTED' : 'DISCONNECTED';
+          const finalStatus = 'DISCONNECTED';
 
           await Account.findOneAndUpdate(
             { sessionId },
             {
               status: finalStatus,
-              errorMessage: `Closed (${statusCode || 'unknown'}). ${shouldReconnect ? 'Reconnecting...' : 'Logged out.'}`,
+              errorMessage: `Closed (${statusCode || 'network'}). ${shouldReconnect ? 'Reconnecting...' : 'Waiting for reconnect.'}`,
             }
           );
 
           broadcastEvent('session:status', {
             sessionId,
             status: finalStatus,
-            message: `Session ${sessionId} disconnected (${statusCode}).`,
+            message: `Session ${sessionId} disconnected (${statusCode || 'closed'}).`,
           });
+
+          await this.broadcastAccounts();
 
           if (shouldReconnect) {
             // Clear existing reconnect timer if any
@@ -188,35 +248,29 @@ class SessionManager {
             }
             const timer = setTimeout(() => {
               this.reconnectTimers.delete(sessionId);
-              this.spawnSession(sessionId);
+              this.spawnSession(sessionId).catch(console.error);
             }, 5000);
             this.reconnectTimers.set(sessionId, timer);
-          } else {
-            // Clean up session auth folder if logged out permanently
-            try {
-              if (fs.existsSync(sessionDir)) {
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-              }
-            } catch (rmErr) {
-              console.warn(`[SessionManager] Auth cleanup error for ${sessionId}:`, rmErr.message);
-            }
           }
+          // Note: Auth directory is NEVER deleted on disconnect/reconnect/restart
         } else if (connection === 'open') {
           this.qrCodes.delete(sessionId);
           const rawJid = sock.user?.id || '';
           const cleanPhone = rawJid.split(':')[0]?.replace(/[^0-9]/g, '') || '';
-          const userName = sock.user?.name || `WhatsApp Account ${sessionId}`;
+          const userName = sock.user?.name || '';
+
+          const updateFields = {
+            status: 'CONNECTED',
+            userJid: rawJid,
+            lastActiveAt: new Date(),
+            errorMessage: '',
+          };
+          if (cleanPhone) updateFields.phone = cleanPhone;
+          if (userName) updateFields.userName = userName;
 
           await Account.findOneAndUpdate(
             { sessionId },
-            {
-              status: 'CONNECTED',
-              phone: cleanPhone,
-              userJid: rawJid,
-              userName,
-              lastActiveAt: new Date(),
-              errorMessage: '',
-            }
+            { $set: updateFields }
           );
 
           broadcastEvent('session:status', {
@@ -224,8 +278,10 @@ class SessionManager {
             status: 'CONNECTED',
             phone: cleanPhone,
             userName,
-            message: `Session ${sessionId} connected successfully (${cleanPhone})`,
+            message: `Session ${sessionId} connected successfully (${cleanPhone || userName})`,
           }, true);
+
+          await this.broadcastAccounts();
         }
       });
 
@@ -298,6 +354,7 @@ class SessionManager {
         { sessionId },
         { status: 'DISCONNECTED', errorMessage: err.message }
       );
+      await this.broadcastAccounts();
       throw err;
     }
   }
@@ -434,7 +491,7 @@ class SessionManager {
   /**
    * Sends a message through a specified session
    */
-  async sendMessage(sessionId, phone, text, leadId = null) {
+  async sendMessage(sessionId, phone, text, leadId = null, options = {}) {
     const sock = this.sessions.get(sessionId);
     if (!sock) {
       throw new Error(`WhatsApp session [${sessionId}] is not currently connected.`);
@@ -456,6 +513,8 @@ class SessionManager {
       { $inc: { sentToday: 1 }, lastActiveAt: new Date() }
     );
 
+    const isOutreach = Boolean(options?.isOutreach || options?.metadata?.isOutreach);
+
     // Update or create ChatThread
     const account = await Account.findOne({ sessionId });
     let thread = await ChatThread.findOne({ leadPhone: phone });
@@ -473,12 +532,28 @@ class SessionManager {
         lastMessageAt: new Date(),
         unreadCount: 0,
         status: 'active',
+        initialOutreachMessage: isOutreach
+          ? {
+              text,
+              sentAt: new Date(),
+              sessionId,
+              accountLabel: account?.label || sessionId,
+            }
+          : undefined,
       });
     } else {
       thread.lastMessage = text;
       thread.lastMessageAt = new Date();
       thread.assignedSessionId = sessionId;
       thread.accountLabel = account?.label || sessionId;
+      if (isOutreach && !thread.initialOutreachMessage?.text) {
+        thread.initialOutreachMessage = {
+          text,
+          sentAt: new Date(),
+          sessionId,
+          accountLabel: account?.label || sessionId,
+        };
+      }
       await thread.save();
     }
 
@@ -494,6 +569,8 @@ class SessionManager {
       text,
       status: 'sent',
       timestamp: new Date(),
+      isOutreach,
+      metadata: options?.metadata || (isOutreach ? { isOutreach: true } : {}),
     });
 
     broadcastEvent('inbox:new_message', {
@@ -554,10 +631,11 @@ class SessionManager {
     this.qrCodes.delete(sessionId);
 
     if (purgeAuth) {
-      const sessionDir = path.join(SESSIONS_BASE_DIR, `session_${sessionId}`);
+      const sessionDir = this.getSessionDir(sessionId);
       try {
         if (fs.existsSync(sessionDir)) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
+          console.log(`[SessionManager] Purged auth directory for ${sessionId}`);
         }
       } catch (rmErr) {
         console.error(`[SessionManager] Failed to remove dir for ${sessionId}:`, rmErr);
@@ -574,6 +652,25 @@ class SessionManager {
       status: 'DISCONNECTED',
       message: `Session ${sessionId} terminated`,
     });
+
+    await this.broadcastAccounts();
+  }
+
+  /**
+   * Broadcasts consolidated accounts list and summary counts to all connected clients
+   */
+  async broadcastAccounts() {
+    try {
+      const allAccounts = await this.getAllSessions();
+      broadcastEvent('accounts:list', allAccounts);
+      broadcastEvent('session:status', {
+        status: 'SYNC',
+        totalAccounts: allAccounts.length,
+        connectedAccounts: allAccounts.filter((a) => a.status === 'CONNECTED').length,
+      });
+    } catch (e) {
+      console.error('[SessionManager] Error broadcasting accounts:', e.message);
+    }
   }
 
   /**

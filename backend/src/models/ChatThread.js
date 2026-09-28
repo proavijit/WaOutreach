@@ -52,6 +52,12 @@ const ChatThreadSchema = new mongoose.Schema(
       default: 'active',
       index: true,
     },
+    initialOutreachMessage: {
+      text: { type: String, default: '' },
+      sentAt: { type: Date, default: null },
+      sessionId: { type: String, default: '' },
+      accountLabel: { type: String, default: '' },
+    },
   },
   {
     timestamps: true,

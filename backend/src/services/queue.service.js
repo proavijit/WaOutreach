@@ -293,7 +293,8 @@ class QueueService {
           selectedAccount.sessionId,
           lead.phone,
           finalMessage,
-          lead._id
+          lead._id,
+          { isOutreach: true }
         );
 
         // Update Lead state to sent

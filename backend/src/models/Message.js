@@ -53,6 +53,15 @@ const MessageSchema = new mongoose.Schema(
       default: Date.now,
       index: true,
     },
+    isOutreach: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    metadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
   },
   {
     timestamps: true,

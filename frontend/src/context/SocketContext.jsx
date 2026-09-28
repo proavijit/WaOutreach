@@ -46,14 +46,21 @@ export function SocketProvider({ children }) {
     });
 
     // Multi-Account Session Events
+    s.on('accounts:list', (data) => {
+      setAccountsRefreshTrigger((prev) => prev + 1);
+      setLastEvent({ type: 'accounts:list', data });
+    });
+
     s.on('session:status', (data) => {
       setAccountsRefreshTrigger((prev) => prev + 1);
-      addLiveLog({
-        type: data.status === 'CONNECTED' ? 'success' : 'info',
-        action: `ACCOUNT: ${data.sessionId || 'SESSION'}`,
-        message: data.message || `Session ${data.sessionId} status: ${data.status}`,
-        timestamp: new Date(),
-      });
+      if (data.sessionId) {
+        addLiveLog({
+          type: data.status === 'CONNECTED' ? 'success' : 'info',
+          action: `ACCOUNT: ${data.sessionId}`,
+          message: data.message || `Session ${data.sessionId} status: ${data.status}`,
+          timestamp: new Date(),
+        });
+      }
       setLastEvent({ type: 'session:status', data });
     });
 

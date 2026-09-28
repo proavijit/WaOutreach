@@ -8,6 +8,8 @@ auth_info_baileys/
 backend/auth_info_baileys/
 auth_sessions/
 backend/auth_sessions/
+data/
+backend/data/
 
 # Environment Variables
 .env
